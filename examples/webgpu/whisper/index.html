@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Whisper-style Pipeline — Python-parity JS Debugger</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 2rem;
+        line-height: 1.35;
+      }
+      h1 {
+        margin-bottom: 0.5rem;
+      }
+      pre {
+        background: #f4f4f4;
+        padding: 1rem;
+        white-space: pre-wrap;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Upload a WAV file</h1>
+    <input type="file" id="fileInput" accept=".wav" />
+
+    <h2>Resampled 16 kHz waveform (first 10)</h2>
+    <pre id="waveOut">Pick a file…</pre>
+
+    <h2>padOrTrim output (first 10)</h2>
+    <pre id="padOut"></pre>
+
+    <h2>STFT magnitude (|X|) — first 10 bins of frame 0</h2>
+    <pre id="ampOut"></pre>
+
+    <h2>Magnitude squared (|X|²) — first 10 bins of frame 0</h2>
+    <pre id="powOut"></pre>
+
+    <h2>Mel projection — first 10 Mel bins of frame 0</h2>
+    <pre id="melOut"></pre>
+
+    <h2>Log-scaled Mel (Whisper normalisation) — first 10 bins of frame 0</h2>
+    <pre id="logOut"></pre>
+
+    <script>
+      /* ─────────────── Constants ─────────────── */
+      const RATE = 16_000,
+        SEG = 30 * RATE,
+        N_FFT = 400,
+        HOP = 160,
+        N_MELS = 80;
+      const TWO_PI = 2 * Math.PI;
+
+      /* Hann window (static) */
+      const HANN = new Float32Array(N_FFT);
+      for (let i = 0; i < N_FFT; ++i)
+        HANN[i] = 0.5 - 0.5 * Math.cos((TWO_PI * i) / N_FFT);
+
+      /* ─────────────── Helper utils ─────────────── */
+      const slice10 = (a) =>
+        Array.from(a.slice(0, 10))
+          .map((v) => v.toFixed(6))
+          .join("\n");
+
+      function fileToArrayBuffer(file) {
+        return new Promise((res, rej) => {
+          const fr = new FileReader();
+          fr.onload = () => res(fr.result);
+          fr.onerror = rej;
+          fr.readAsArrayBuffer(file);
+        });
+      }
+
+      /* ─────────────── WAV → 16 kHz mono (unchanged) ─────────────── */
+      function readResampleMonoWav(bytes, targetRate = 16_000) {
+        const dv = new DataView(bytes.buffer);
+        const txt = (o, l) => String.fromCharCode(...bytes.slice(o, o + l));
+        if (txt(0, 4) !== "RIFF" || txt(8, 4) !== "WAVE")
+          throw Error("Not a WAV");
+        let off = 12,
+          fmt = -1,
+          data = -1,
+          size = 0;
+        while (off < bytes.length) {
+          const id = txt(off, 4),
+            sz = dv.getUint32(off + 4, true);
+          if (id === "fmt ") fmt = off + 8;
+          else if (id === "data") {
+            data = off + 8;
+            size = sz;
+            break;
+          }
+          off += 8 + sz + (sz & 1);
+        }
+        if (fmt < 0 || data < 0) throw Error("Bad WAV");
+        const ch = dv.getUint16(fmt + 2, true);
+        const srcRate = dv.getUint32(fmt + 4, true);
+        const bps = dv.getUint16(fmt + 14, true) / 8;
+        const ints = [];
+        for (let i = 0; i < size; i += bps) {
+          const p = data + i;
+          let v;
+          if (bps === 1) v = dv.getUint8(p);
+          else if (bps === 2) v = dv.getInt16(p, true);
+          else if (bps === 4) v = dv.getInt32(p, true);
+          else throw Error("Bit-depth");
+          ints.push(v);
+        }
+        const floats = ints.map((v) =>
+          bps === 1 ? (v - 128) / 128 : bps === 2 ? v / 32768 : v / 2147483648
+        );
+        const mono = [];
+        for (let i = 0; i < floats.length; i += ch) {
+          let s = 0;
+          for (let c = 0; c < ch; ++c) s += floats[i + c];
+          mono.push(s / ch);
+        }
+        const ratio = targetRate / srcRate;
+        const outLen = Math.floor(mono.length * ratio);
+        const out = new Float32Array(outLen);
+        for (let n = 0; n < outLen; ++n) {
+          const pos = n / ratio,
+            l = Math.floor(pos),
+            r = Math.min(l + 1, mono.length - 1);
+          const f = pos - l;
+          out[n] = mono[l] * (1 - f) + mono[r] * f;
+        }
+        return out;
+      }
+
+      /* ─────────────── Slaney-style Mel scale (Python parity) ─────────────── */
+      function hzToMel(f, htk = false) {
+        if (htk) return 2595.0 * Math.log10(1 + f / 700.0);
+        const f_0 = 0.0,
+          f_sp = 200.0 / 3,
+          minLogHz = 1000.0,
+          minLogMel = (minLogHz - f_0) / f_sp,
+          logstep = Math.log(6.4) / 27.0;
+        return f < minLogHz
+          ? (f - f_0) / f_sp
+          : minLogMel + Math.log(f / minLogHz) / logstep;
+      }
+
+      function melToHz(mel, htk = false) {
+        if (htk) return 700.0 * (10 ** (mel / 2595.0) - 1.0);
+        const f_0 = 0.0,
+          f_sp = 200.0 / 3,
+          minLogHz = 1000.0,
+          minLogMel = (minLogHz - f_0) / f_sp,
+          logstep = Math.log(6.4) / 27.0;
+        return mel < minLogMel
+          ? f_0 + f_sp * mel
+          : minLogHz * Math.exp(logstep * (mel - minLogMel));
+      }
+
+      function buildMelBank(
+        sr = RATE,
+        n_fft = N_FFT,
+        n_mels = N_MELS,
+        fmin = 0.0,
+        fmax = sr / 2,
+        htk = false,
+        norm = "slaney"
+      ) {
+        const melMin = hzToMel(fmin, htk);
+        const melMax = hzToMel(fmax, htk);
+        const melPoints = Array.from(
+          { length: n_mels + 2 },
+          (_, i) => melMin + ((melMax - melMin) * i) / (n_mels + 1)
+        );
+        const hzPoints = melPoints.map((m) => melToHz(m, htk));
+        const fftBins = hzPoints.map((hz) =>
+          Math.floor(((n_fft + 1) * hz) / sr)
+        );
+
+        const nFftBins = (n_fft >> 1) + 1;
+        const bank = Array.from(
+          { length: n_mels },
+          () => new Float32Array(nFftBins)
+        );
+
+        for (let m = 1; m <= n_mels; ++m) {
+          const left = fftBins[m - 1],
+            center = fftBins[m],
+            right = fftBins[m + 1];
+
+          if (center > left) {
+            for (let k = left; k < center; ++k)
+              bank[m - 1][k] = (k - left) / (center - left);
+          }
+          if (right > center) {
+            for (let k = center; k < right; ++k)
+              bank[m - 1][k] = (right - k) / (right - center);
+          }
+
+          if (norm === "slaney") {
+            const denom = hzPoints[m + 1] - hzPoints[m - 1];
+            const scale = denom === 0 ? 0 : 2.0 / denom;
+            for (let k = 0; k < nFftBins; ++k) bank[m - 1][k] *= scale;
+          }
+        }
+        return bank;
+      }
+
+      const MEL_BANK = buildMelBank();
+
+      function applyMelBank(power) {
+        const mel = new Float32Array(N_MELS);
+        for (let m = 0; m < N_MELS; ++m) {
+          let s = 0,
+            filt = MEL_BANK[m];
+          for (let k = 0; k < filt.length; ++k) s += filt[k] * power[k];
+          mel[m] = s;
+        }
+        return mel;
+      }
+
+      /* ─────────────── Naïve DFT-based STFT (Python parity) ─────────────── */
+      function dft(frame) {
+        const bins = N_FFT >> 1,
+          mag = new Float32Array(bins + 1),
+          pow = new Float32Array(bins + 1);
+        for (let k = 0; k <= bins; ++k) {
+          let re = 0,
+            im = 0,
+            angFactor = (-TWO_PI * k) / N_FFT;
+          for (let n = 0; n < N_FFT; ++n) {
+            const phi = angFactor * n,
+              v = frame[n];
+            re += v * Math.cos(phi);
+            im += v * Math.sin(phi);
+          }
+          mag[k] = Math.hypot(re, im);
+          pow[k] = re * re + im * im;
+        }
+        return { mag, pow };
+      }
+
+      function stft(sig) {
+        const frames = Math.floor((sig.length - N_FFT) / HOP) + 1;
+        const mags = [],
+          pows = [];
+        for (let i = 0; i < frames; ++i) {
+          const start = i * HOP;
+          const win = new Float32Array(N_FFT);
+          for (let j = 0; j < N_FFT; ++j) win[j] = sig[start + j] * HANN[j];
+          const { mag, pow } = dft(win);
+          mags.push(mag);
+          pows.push(pow);
+        }
+        return { mags, pows }; // arrays of length frames
+      }
+
+      /* ─────────────── Core prepAudio (Python line-for-line) ─────────────── */
+      function padOrTrim(arr, targetLen) {
+        if (arr.length === targetLen) return arr;
+        if (arr.length < targetLen) {
+          const out = new Float32Array(targetLen);
+          out.set(arr);
+          return out;
+        }
+        return arr.subarray(0, targetLen);
+      }
+
+      function centerPad(sig) {
+        const out = new Float32Array(sig.length + N_FFT);
+        out.set(sig, N_FFT >> 1); // zeros automatically on both sides
+        return out;
+      }
+
+      function prepAudio(waves, batchSize, truncate = false) {
+        /* 1) pad_or_trim to 30-s multiples (Python parity) */
+        let maxLen = truncate ? SEG : Math.max(...waves.map((w) => w.length));
+        if (maxLen % SEG) maxLen += SEG - (maxLen % SEG);
+        const padded = waves
+          .slice(0, batchSize)
+          .map((w) => padOrTrim(w, maxLen));
+        while (padded.length < batchSize) padded.push(new Float32Array(maxLen));
+
+        /* 2) Centre-pad by N_FFT/2 zeros on both sides */
+        const cp = centerPad(padded[0]); // debug: first sample only
+
+        /* 3) STFT */
+        const { mags, pows } = stft(cp);
+        pows.pop(); // drop last frame → 3000
+
+        /* 4) Mel projection for every frame (80 × 3000) */
+        const frames = pows.length;
+        const melSpec = Array.from(
+          { length: N_MELS },
+          () => new Float32Array(frames)
+        );
+        for (let i = 0; i < frames; ++i) {
+          const mel = applyMelBank(pows[i]);
+          for (let m = 0; m < N_MELS; ++m) melSpec[m][i] = mel[m];
+        }
+
+        /* 5) Log / dynamic-range compression */
+        let maxLog = -Infinity;
+        for (let m = 0; m < N_MELS; ++m) {
+          const row = melSpec[m];
+          for (let i = 0; i < frames; ++i) {
+            const v = Math.log10(Math.max(row[i], 1e-10));
+            if (v > maxLog) maxLog = v;
+          }
+        }
+        const floor = maxLog - 8.0;
+        const logSpec = Array.from(
+          { length: N_MELS },
+          () => new Float32Array(frames)
+        );
+        for (let m = 0; m < N_MELS; ++m) {
+          for (let i = 0; i < frames; ++i) {
+            let x = Math.log10(Math.max(melSpec[m][i], 1e-10));
+            x = Math.max(x, floor);
+            logSpec[m][i] = (x + 4.0) / 4.0;
+          }
+        }
+
+        /* 6) Build debug snapshot matching Python prints */
+        const debug = {
+          pad: padded[0].slice(0, 10),
+          amp: mags[0].slice(0, 10),
+          pow: pows[0].slice(0, 10),
+          mel: Array.from({ length: 10 }, (_, i) => melSpec[i][0]),
+          log: Array.from({ length: 10 }, (_, i) => logSpec[i][0]),
+        };
+        return debug;
+      }
+
+      /* ─────────────── UI wiring ─────────────── */
+      const out = (id, arr) =>
+        (document.getElementById(id).textContent = slice10(arr));
+
+      document
+        .getElementById("fileInput")
+        .addEventListener("change", async (e) => {
+          const f = e.target.files[0];
+          if (!f) return;
+          try {
+            const bytes = new Uint8Array(await fileToArrayBuffer(f));
+            const resampled = readResampleMonoWav(bytes, 16_000);
+            out("waveOut", resampled);
+
+            const dbg = prepAudio([resampled], 1, true);
+            out("padOut", dbg.pad);
+            out("ampOut", dbg.amp);
+            out("powOut", dbg.pow);
+            out("melOut", dbg.mel);
+            out("logOut", dbg.log);
+          } catch (err) {
+            [
+              "waveOut",
+              "padOut",
+              "ampOut",
+              "powOut",
+              "melOut",
+              "logOut",
+            ].forEach(
+              (id) =>
+                (document.getElementById(id).textContent =
+                  "Error: " + err.message)
+            );
+          }
+        });
+    </script>
+  </body>
+</html>
